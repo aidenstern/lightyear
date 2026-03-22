@@ -268,3 +268,6 @@ module_inception = "allow"
 alloc_instead_of_core = "warn"
 std_instead_of_alloc = "warn"
 std_instead_of_core = "warn"
+
+[patch.crates-io]
+bevy_replicon = { path = "../bevy_replicon" }

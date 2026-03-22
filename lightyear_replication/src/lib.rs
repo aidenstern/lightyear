@@ -116,7 +116,8 @@ impl PluginGroup for LightyearRepliconBackend {
 
         #[cfg(feature = "server")]
         {
-            let mut server_plugin = bevy_replicon::server::ServerPlugin::default();
+            let mut server_plugin = bevy_replicon::server::ServerPlugin::default()
+                .with_receive_from_clients(true);
             server_plugin.tick_schedule = None;
             group = group.add(server_plugin);
             group = group.add(server::RepliconServerPlugin);

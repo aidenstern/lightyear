@@ -1,11 +1,15 @@
+use alloc::vec::Vec;
 use bevy_app::prelude::*;
-use bevy_ecs::prelude::*;
+use bevy_ecs::{
+    entity::{EntityHashMap, hash_set::EntityHashSet},
+    prelude::*,
+};
 use bevy_state::prelude::*;
 
 use bevy_replicon::prelude::*;
 use bevy_replicon::shared::backend::connected_client::NetworkId;
-use bevy_replicon::shared::server_entity_map::ServerEntityMap;
 use lightyear_connection::client::Connected;
+use lightyear_connection::client_of::ClientOf;
 use lightyear_connection::server::{Started, Stopped};
 use lightyear_core::id::RemoteId;
 use lightyear_messages::MessageManager;
@@ -15,7 +19,7 @@ use lightyear_transport::prelude::Transport;
 
 use crate::channels::RepliconChannelMap;
 use lightyear_messages::plugin::MessageSystems;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// Adds the replicon server-side backend bridge for lightyear.
 ///
@@ -119,7 +123,7 @@ fn sync_server_state(
 fn receive_server_packets(
     channel_map: Res<RepliconChannelMap>,
     mut server_messages: ResMut<ServerMessages>,
-    mut transports: Query<(Entity, &mut Transport)>,
+    mut transports: Query<(Entity, &mut Transport), With<ClientOf>>,
 ) {
     for (entity, mut transport) in transports.iter_mut() {
         for (idx, &(_, channel_id)) in channel_map.client_channels.iter().enumerate() {
@@ -156,43 +160,64 @@ fn send_server_packets(
     }
 }
 
-/// Sync replicon's `ServerEntityMap` entries to lightyear's `MessageManager.entity_mapper`.
+/// Sync receive-side remote entity ids into lightyear's `MessageManager.entity_mapper`.
 ///
-/// This bridges replicon's entity tracking with lightyear's messaging entity map.
-/// Handles both additions and removals: entities that are in `ServerEntityMap` are added
-/// to the entity_mapper, and entities that were previously synced but are no longer in
-/// `ServerEntityMap` are removed.
+/// Dedicated servers no longer have a singleton `ServerEntityMap` when receiving
+/// client-authored replication. Instead, each received remote entity carries its
+/// source link (`ReplicatedFrom`) and original remote entity id (`RemoteEntity`).
+/// We rebuild the per-link lightyear mapping from those components.
 fn sync_entity_map(
-    entity_map: Option<Res<ServerEntityMap>>,
-    mut managers: Query<&mut MessageManager>,
-    mut synced_entities: Local<bevy_platform::collections::HashSet<Entity>>,
+    remotes: Query<(Entity, &ReplicatedFrom, &RemoteEntity), With<Remote>>,
+    mut managers: Query<&mut MessageManager, With<ClientOf>>,
+    mut synced_entities: Local<EntityHashMap<EntityHashSet>>,
 ) {
-    let Some(entity_map) = entity_map else {
-        return;
-    };
-    if !entity_map.is_changed() {
-        return;
-    }
-    // Collect current replicon entities
-    let current: bevy_platform::collections::HashSet<Entity> = entity_map
-        .to_client()
-        .iter()
-        .map(|(server_entity, _)| *server_entity)
-        .collect();
+    let mut current = EntityHashMap::<EntityHashSet>::default();
+    let mut mappings = EntityHashMap::<Vec<(Entity, Entity)>>::default();
 
-    // In replicon: server_entity = remote entity, client_entity = local entity
-    // In lightyear: remote_entity = remote, local_entity = local
-    // So we map: replicon server_entity -> lightyear remote, replicon client_entity -> lightyear local
-    for mut mm in managers.iter_mut() {
-        // Add new entries
-        for (server_entity, client_entity) in entity_map.to_client().iter() {
-            mm.entity_mapper.insert(*server_entity, *client_entity);
-        }
-        // Remove entries that are no longer in ServerEntityMap
-        for removed in synced_entities.difference(&current) {
-            mm.entity_mapper.remove_by_remote(*removed);
-        }
+    for (local_entity, replicated_from, remote_entity) in &remotes {
+        current
+            .entry(replicated_from.0)
+            .or_default()
+            .insert(remote_entity.0);
+        mappings
+            .entry(replicated_from.0)
+            .or_default()
+            .push((remote_entity.0, local_entity));
     }
 
-    synced_entities.clone_from(&current);
+    for (source, entries) in &mappings {
+        let Ok(mut manager) = managers.get_mut(*source) else {
+            continue;
+        };
+
+        for (remote_entity, local_entity) in entries {
+            manager.entity_mapper.insert(*remote_entity, *local_entity);
+        }
+
+        if let Some(previous) = synced_entities.get(source)
+            && let Some(current_entities) = current.get(source)
+        {
+            for remote_entity in previous.iter() {
+                if !current_entities.contains(remote_entity) {
+                    manager.entity_mapper.remove_by_remote(*remote_entity);
+                }
+            }
+        }
+    }
+
+    for (source, previous) in synced_entities.iter() {
+        if current.contains_key(source) {
+            continue;
+        }
+
+        let Ok(mut manager) = managers.get_mut(*source) else {
+            continue;
+        };
+
+        for remote_entity in previous.iter() {
+            manager.entity_mapper.remove_by_remote(*remote_entity);
+        }
+    }
+
+    *synced_entities = current;
 }

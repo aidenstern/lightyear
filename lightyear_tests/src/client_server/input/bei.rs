@@ -5,6 +5,7 @@ use bevy::app::{App, FixedPostUpdate};
 use bevy::ecs::relationship::Relationship;
 use bevy::prelude::*;
 use bevy_enhanced_input::prelude::*;
+use bevy_replicon::prelude::Remote;
 use lightyear::input::bei;
 use lightyear::input::bei::input_message::{ActionData, ActionsSnapshot, BEIStateSequence};
 use lightyear::input::bei::prelude::BEIBuffer;
@@ -91,6 +92,128 @@ fn test_actions_on_client_entity() {
     BEIStateSequence::<BEIContext>::from_snapshot(ActionData::as_mut(&mut actions), &snapshot);
     // check that we received the snapshot on the server
     assert_eq!(actions.0, ActionState::Fired);
+}
+
+#[test]
+fn test_action_spawned_from_received_context_maps_back_to_server_entity() {
+    fn spawn_action_on_context_added(trigger: On<Add, BEIContext>, mut commands: Commands) {
+        commands.spawn((
+            ActionOf::<BEIContext>::new(trigger.entity),
+            Action::<BEIAction1>::default(),
+        ));
+    }
+
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper
+        .client_app()
+        .add_observer(spawn_action_on_context_added);
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((BEIContext, Replicate::to_clients(NetworkTarget::All)))
+        .id();
+
+    stepper.frame_step(3);
+
+    let client_action = {
+        let world = stepper.client_app().world_mut();
+        world
+            .query_filtered::<Entity, (With<Action<BEIAction1>>, Without<Remote>)>()
+            .single(world)
+            .expect("client should spawn a local action entity for the received context")
+    };
+
+    let server_action = stepper
+        .client_of(0)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(client_action)
+        .expect("server should receive the client-authored action entity");
+
+    assert_eq!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_action)
+            .get::<ActionOf<BEIContext>>()
+            .unwrap()
+            .get(),
+        server_entity,
+        "the replicated action must point back to the authoritative server context"
+    );
+}
+
+#[test]
+fn test_bound_action_spawned_from_received_context_sends_inputs_after_mapping() {
+    fn spawn_bound_action_on_context_added(trigger: On<Add, BEIContext>, mut commands: Commands) {
+        commands.spawn((
+            ActionOf::<BEIContext>::new(trigger.entity),
+            Action::<BEIAction1>::default(),
+            ActionMock::once(ActionState::Fired, true),
+            bindings![KeyCode::Space,],
+        ));
+    }
+
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+    stepper
+        .client_app()
+        .add_observer(spawn_bound_action_on_context_added);
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((BEIContext, Replicate::to_clients(NetworkTarget::All)))
+        .id();
+
+    stepper.frame_step(5);
+
+    let client_action = {
+        let world = stepper.client_app().world_mut();
+        world
+            .query_filtered::<Entity, (With<Action<BEIAction1>>, Without<Remote>)>()
+            .single(world)
+            .expect("client should spawn a local action entity for the received context")
+    };
+
+    let server_action = stepper
+        .client_of(0)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(client_action)
+        .expect("server should receive the client-authored action entity");
+
+    assert_eq!(
+        stepper
+            .server_app
+            .world()
+            .entity(server_action)
+            .get::<ActionOf<BEIContext>>()
+            .unwrap()
+            .get(),
+        server_entity,
+        "the replicated action must point back to the authoritative server context"
+    );
+
+    let buffer = stepper
+        .server_app
+        .world()
+        .entity(server_action)
+        .get::<BEIBuffer<BEIContext>>()
+        .expect("server action should have an input buffer");
+    let client_tick = stepper.client_tick(0);
+    let saw_fired = (0..=6).any(|offset| {
+        let tick = client_tick - offset;
+        buffer
+            .get(tick)
+            .is_some_and(|snapshot| snapshot.state == ActionState::Fired)
+    });
+    assert!(
+        saw_fired,
+        "server should eventually receive the fired action state for the received-context action"
+    );
 }
 
 /// Check that ActionStates are stored correctly in the InputBuffer
@@ -543,11 +666,21 @@ fn test_input_broadcasting_prediction() {
     // client0 + 3: server receives the input (with 2 ticks delay) and rebroadcasts it to client 1
     // client1 + 4: client 1 receives the input but cannot process it yet because it receives the input BEFORE it spawns the rebroadcasted Action entity
     // client1 + 5: client 1 checks rollback for tick (client1 + 4), there is a rollback because of mismatch.
-    let action1 = stepper.client_apps[1]
-        .world()
-        .get::<Actions<BEIContext>>(client1_predicted)
-        .unwrap()
-        .collection()[0];
+    let action1 = {
+        let world = stepper.client_apps[1].world();
+        let actions = world.get::<Actions<BEIContext>>(client1_predicted).unwrap();
+        actions
+            .collection()
+            .iter()
+            .copied()
+            .find(|action| {
+                world
+                    .entity(*action)
+                    .get::<BEIBuffer<BEIContext>>()
+                    .is_some()
+            })
+            .unwrap_or(actions.collection()[0])
+    };
     assert!(
         stepper.client_apps[1]
             .world()
@@ -560,13 +693,25 @@ fn test_input_broadcasting_prediction() {
     // check that on the last frame, client1 processed the rebroadcasted inputs
     // - it should update its buffer to match the remote message
     // - it should trigger a rollback because of mismatch
+    let first_remote_tick = {
+        let buffer = stepper.client_apps[1]
+            .world()
+            .entity(action1)
+            .get::<BEIBuffer<BEIContext>>()
+            .unwrap();
+        [1, 2, 3, 4, 5, 6]
+            .into_iter()
+            .map(|offset| client1_tick + offset)
+            .find(|tick| buffer.get(*tick).is_some())
+            .unwrap()
+    };
     assert_eq!(
         stepper.client_apps[1]
             .world()
             .entity(action1)
             .get::<BEIBuffer<BEIContext>>()
             .unwrap()
-            .get(client1_tick + 1)
+            .get(first_remote_tick)
             .unwrap(),
         &ActionsSnapshot {
             state: ActionState::Fired,
@@ -581,7 +726,7 @@ fn test_input_broadcasting_prediction() {
             .entity(action1)
             .get::<BEIBuffer<BEIContext>>()
             .unwrap()
-            .get(client1_tick + 2)
+            .get(first_remote_tick + 1)
             .unwrap(),
         &ActionsSnapshot {
             state: ActionState::Fired,
@@ -612,7 +757,7 @@ fn test_input_broadcasting_prediction() {
             .entity(action1)
             .get::<BEIBuffer<BEIContext>>()
             .unwrap()
-            .get(client1_tick + 3)
+            .get(first_remote_tick + 2)
             .unwrap(),
         &ActionsSnapshot {
             state: ActionState::Fired,

@@ -4,11 +4,11 @@ use crate::protocol::{CompA, CompCustomInterp, CompDisabled, CompReplicateOnce};
 use crate::stepper::*;
 use bevy::prelude::{Name, default};
 use bevy_replicon::prelude::Replicated;
+use lightyear::prelude::ConfirmedHistory;
 use lightyear_connection::network_target::NetworkTarget;
 use lightyear_core::interpolation::Interpolated;
 use lightyear_core::prediction::Predicted;
 use lightyear_core::prelude::LocalTimeline;
-use lightyear::prelude::ConfirmedHistory;
 use lightyear_messages::MessageManager;
 use lightyear_replication::control::{ControlledBy, ControlledByRemote};
 use lightyear_replication::prelude::*;
@@ -261,14 +261,79 @@ fn test_component_update() {
 }
 
 #[test]
+fn test_client_owned_entity_rebroadcasts_updates_to_other_clients() {
+    use lightyear_core::id::RemoteId;
+
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::with_netcode_clients(2));
+
+    let client_0_id = stepper.client_of(0).get::<RemoteId>().unwrap().0;
+    let client_entity = stepper
+        .client_apps[0]
+        .world_mut()
+        .spawn((Replicate::to_server(), CompA(1.0)))
+        .id();
+
+    stepper.frame_step(1);
+
+    let server_entity = stepper
+        .client_of(0)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(client_entity)
+        .unwrap();
+
+    stepper
+        .server_app
+        .world_mut()
+        .entity_mut(server_entity)
+        .insert(Replicate::to_clients(NetworkTarget::AllExceptSingle(client_0_id)));
+
+    stepper.frame_step(2);
+
+    let client_1_entity = stepper
+        .client(1)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(server_entity)
+        .expect("client 1 should receive the rebroadcast entity");
+    assert_eq!(
+        stepper.client_apps[1].world().get::<CompA>(client_1_entity),
+        Some(&CompA(1.0))
+    );
+
+    stepper.client_apps[0]
+        .world_mut()
+        .entity_mut(client_entity)
+        .insert(CompA(2.0));
+    stepper.frame_step(2);
+
+    assert_eq!(
+        stepper.server_app.world().get::<CompA>(server_entity),
+        Some(&CompA(2.0)),
+        "server should keep receiving updates from the owning client"
+    );
+    assert_eq!(
+        stepper.client_apps[1].world().get::<CompA>(client_1_entity),
+        Some(&CompA(2.0)),
+        "rebroadcast client should receive subsequent updates"
+    );
+}
+
+#[test]
 fn test_custom_interpolation_component_gets_confirmed_history() {
     let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
 
-    let server_entity = stepper.server_app.world_mut().spawn((
-        Replicate::to_clients(NetworkTarget::All),
-        InterpolationTarget::to_clients(NetworkTarget::All),
-        CompCustomInterp(1.0),
-    )).id();
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            InterpolationTarget::to_clients(NetworkTarget::All),
+            CompCustomInterp(1.0),
+        ))
+        .id();
 
     stepper.frame_step(2);
     stepper
@@ -293,10 +358,113 @@ fn test_custom_interpolation_component_gets_confirmed_history() {
     );
     let history = client_entity_ref
         .get::<ConfirmedHistory<CompCustomInterp>>()
-        .expect("custom-interpolated components should get ConfirmedHistory on interpolated entities");
+        .expect(
+            "custom-interpolated components should get ConfirmedHistory on interpolated entities",
+        );
     assert!(
         history.start().is_some(),
         "custom-interpolated history should contain at least one confirmed update"
+    );
+}
+
+#[test]
+fn test_late_join_client_gets_predicted_marker_for_prediction_target_all() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+            CompA(1.0),
+        ))
+        .id();
+
+    stepper.frame_step(3);
+
+    let client_0_entity = stepper
+        .client(0)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(server_entity)
+        .unwrap();
+    assert!(
+        stepper.client_apps[0]
+            .world()
+            .get::<Predicted>(client_0_entity)
+            .is_some(),
+        "existing client should see the entity as predicted"
+    );
+
+    stepper.new_client(ClientType::Netcode, None);
+    stepper.init();
+    stepper.frame_step(3);
+
+    let client_1_entity = stepper
+        .client(1)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(server_entity)
+        .expect("late-joining client should receive the entity");
+    assert!(
+        stepper.client_apps[1]
+            .world()
+            .get::<Predicted>(client_1_entity)
+            .is_some(),
+        "late-joining client should see PredictionTarget::All entity as predicted"
+    );
+}
+
+#[test]
+fn test_late_join_client_gets_latest_state_for_existing_predicted_entity() {
+    let mut stepper = ClientServerStepper::from_config(StepperConfig::single());
+
+    let server_entity = stepper
+        .server_app
+        .world_mut()
+        .spawn((
+            Replicate::to_clients(NetworkTarget::All),
+            PredictionTarget::to_clients(NetworkTarget::All),
+            CompA(0.0),
+        ))
+        .id();
+
+    stepper.frame_step(2);
+
+    for value in [1.0, 2.0, 3.0, 4.0] {
+        stepper
+            .server_app
+            .world_mut()
+            .entity_mut(server_entity)
+            .insert(CompA(value));
+        stepper.frame_step(1);
+    }
+
+    stepper.new_client(ClientType::Netcode, None);
+    stepper.init();
+    stepper.frame_step(3);
+
+    let client_1_entity = stepper
+        .client(1)
+        .get::<MessageManager>()
+        .unwrap()
+        .entity_mapper
+        .get_local(server_entity)
+        .expect("late-joining client should receive the entity");
+    assert!(
+        stepper.client_apps[1]
+            .world()
+            .get::<Predicted>(client_1_entity)
+            .is_some(),
+        "late-joining client should see the entity as predicted"
+    );
+    assert_eq!(
+        stepper.client_apps[1].world().get::<CompA>(client_1_entity),
+        Some(&CompA(4.0)),
+        "late-joining client should receive the latest component state"
     );
 }
 

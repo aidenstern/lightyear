@@ -245,6 +245,10 @@ impl ReplicationTargetT for () {
         if host_client {
             context.0 = Some(sender_entity);
         }
+        let remote_authoritative = state
+            .per_sender_state
+            .values()
+            .any(|sender_state| sender_state.authority == Some(false));
         // only insert a sender if it was not already present
         // since it could already be present with no_authority (if we received the entity from a remote peer)
         state
@@ -252,13 +256,17 @@ impl ReplicationTargetT for () {
             .entry(sender_entity)
             .and_modify(|s| {
                 // authority could be set to None (for example if PredictionTarget is processed first)
-                if s.authority.is_none() {
+                if s.authority.is_none() && !remote_authoritative {
                     context.1 = true;
                 }
             })
             .or_insert_with(|| {
-                context.1 = true;
-                PerSenderReplicationState::with_authority()
+                if remote_authoritative {
+                    PerSenderReplicationState::without_authority()
+                } else {
+                    context.1 = true;
+                    PerSenderReplicationState::with_authority()
+                }
             });
     }
 
@@ -639,7 +647,92 @@ fn update_replication_tick(
         // as u16 wraps automatically (truncates high bits)
         let current_tick = replication_tick.get() as u16;
         let new_tick = timeline.tick();
-        replication_tick.increment_by((new_tick - current_tick).0 as u32);
+        let delta = (new_tick - current_tick).0 as u32;
+        if delta != 0 {
+            // Avoid marking ServerTick as changed when the timeline hasn't advanced yet.
+            // Client->server replication can use a zero-duration timer, and increment_by(0)
+            // would otherwise resend empty mutate packets for the same RepliconTick.
+            replication_tick.increment_by(delta);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_ecs::schedule::common_conditions::resource_changed;
+    use bevy_time::Time;
+    use core::time::Duration;
+
+    #[derive(Resource, Default)]
+    struct SendCount(usize);
+
+    fn count_sends(mut count: ResMut<SendCount>) {
+        count.0 += 1;
+    }
+
+    #[test]
+    fn zero_timeline_delta_does_not_trigger_send() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        app.insert_resource(LocalTimeline::default());
+        app.insert_resource(ReplicationMetadata::default());
+        app.init_resource::<ServerTick>();
+        app.init_resource::<SendCount>();
+        app.add_systems(Update, update_replication_tick);
+        app.add_systems(
+            Update,
+            count_sends
+                .after(update_replication_tick)
+                .run_if(resource_changed::<ServerTick>),
+        );
+        app.world_mut().clear_trackers();
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(1));
+        app.update();
+
+        assert_eq!(app.world().resource::<ServerTick>().get(), 0);
+        assert_eq!(app.world().resource::<SendCount>().0, 0);
+    }
+
+    #[test]
+    fn timeline_advance_triggers_single_send() {
+        let mut app = App::new();
+        app.init_resource::<Time>();
+        app.insert_resource(LocalTimeline::default());
+        app.insert_resource(ReplicationMetadata::default());
+        app.init_resource::<ServerTick>();
+        app.init_resource::<SendCount>();
+        app.add_systems(Update, update_replication_tick);
+        app.add_systems(
+            Update,
+            count_sends
+                .after(update_replication_tick)
+                .run_if(resource_changed::<ServerTick>),
+        );
+        app.world_mut().clear_trackers();
+
+        app.world_mut()
+            .resource_mut::<LocalTimeline>()
+            .apply_delta(1);
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(1));
+        app.update();
+
+        assert_eq!(app.world().resource::<ServerTick>().get(), 1);
+        assert_eq!(app.world().resource::<SendCount>().0, 1);
+
+        app.world_mut().clear_trackers();
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(Duration::from_millis(1));
+        app.update();
+
+        assert_eq!(app.world().resource::<ServerTick>().get(), 1);
+        assert_eq!(app.world().resource::<SendCount>().0, 1);
     }
 }
 

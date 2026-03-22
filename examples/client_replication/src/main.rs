@@ -39,6 +39,7 @@ fn main() {
         Some(Mode::Client { .. }) => {
             use lightyear::prelude::Client;
             app.add_plugins(ExampleClientPlugin);
+            app.insert_resource(lightyear::prelude::ReplicationMetadata::new(SEND_INTERVAL));
             let client = app
                 .world_mut()
                 .query_filtered::<Entity, With<Client>>()

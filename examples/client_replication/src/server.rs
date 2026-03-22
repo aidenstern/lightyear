@@ -3,6 +3,7 @@ use crate::protocol::*;
 use crate::shared;
 use crate::shared::color_from_id;
 use bevy::prelude::*;
+use bevy_replicon::prelude::Remote;
 use core::time::Duration;
 use lightyear::connection::client::PeerMetadata;
 use lightyear::input::bei::prelude::Fire;
@@ -54,9 +55,9 @@ pub(crate) fn on_connect(
 
 /// When we receive a replicated Cursor, replicate it to all other clients
 pub(crate) fn replicate_cursors(
-    trigger: On<Add, (CursorPosition, Replicated)>,
+    trigger: On<Add, CursorPosition>,
     mut commands: Commands,
-    cursor_query: Query<&PlayerId, With<CursorPosition>>,
+    cursor_query: Query<&PlayerId, (With<CursorPosition>, With<Remote>)>,
     peer_metadata: Res<PeerMetadata>,
 ) {
     let entity = trigger.entity;

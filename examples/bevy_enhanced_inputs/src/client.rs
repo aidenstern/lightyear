@@ -11,6 +11,7 @@ use crate::shared;
 use bevy::prelude::*;
 use lightyear::input::bei::prelude::{Action, ActionOf, Bindings, Cardinal, Fire};
 use lightyear::prelude::*;
+use lightyear::prelude::input::bei::InputMarker;
 
 pub struct ExampleClientPlugin;
 
@@ -52,13 +53,18 @@ pub(crate) fn handle_predicted_spawn(
             ..Hsva::from(color.0)
         };
         color.0 = Color::from(hsva);
-        warn!("Add InputMarker to entity: {:?}", entity);
         if controlled {
-            // add Action entities to the predicted Context
+            warn!("Add InputMarker to entity: {:?}", entity);
+            // Mark the locally controlled context as an input source so BEI propagates
+            // the marker to its action entities.
+            commands
+                .entity(entity)
+                .insert(InputMarker::<Player>::default());
             commands.spawn((
                 ActionOf::<Player>::new(entity),
                 Action::<Movement>::new(),
                 Bindings::spawn(Cardinal::wasd_keys()),
+                InputMarker::<Player>::default(),
             ));
         }
     }
