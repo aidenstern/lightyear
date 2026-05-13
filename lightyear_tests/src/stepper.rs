@@ -218,6 +218,19 @@ impl ClientServerStepper {
         client_type: ClientType,
         metrics_registry: Option<MetricsRegistry>,
     ) -> usize {
+        self.new_client_with_setup(client_type, metrics_registry, |_| {})
+    }
+
+    /// Like [`new_client`], but invokes `setup` on the freshly built client `App`
+    /// after lightyear's plugins are added and before `finish()` + `cleanup()`.
+    /// Lets downstream tests attach their own plugins (game code, physics, etc.)
+    /// to the client side of the stepper.
+    pub fn new_client_with_setup(
+        &mut self,
+        client_type: ClientType,
+        metrics_registry: Option<MetricsRegistry>,
+        setup: impl FnOnce(&mut App),
+    ) -> usize {
         let mut client_app = App::new();
         client_app.add_plugins((
             MinimalPlugins,
@@ -240,6 +253,7 @@ impl ClientServerStepper {
         client_app.add_plugins(ProtocolPlugin {
             avian_mode: self.avian_mode,
         });
+        setup(&mut client_app);
         client_app.finish();
         client_app.cleanup();
         let client_id = self.client_entities.len();
